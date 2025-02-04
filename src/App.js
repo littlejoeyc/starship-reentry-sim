@@ -53,7 +53,8 @@ const AtmosphereMaterial = shaderMaterial(
         float t = (temperature - baseTemp) / (plasmaThreshold - baseTemp);
         color = vec3(t, 0.0, 1.0 - t);
       }
-      gl_FragColor = vec4(color, 0.8);
+      // Changed alpha value from 0.8 to 0.4 for greater translucency.
+      gl_FragColor = vec4(color, 0.4);
     }
   `
 );
@@ -102,7 +103,8 @@ function AtmosphereVolume({ simulationState, shipBottomY }) {
  */
 function Starship({ magnetPower, simulationState, setSimulationState, isRunning }) {
   const shipRef = useRef();
-  const width = 9, height = 50, depth = 9;
+  // Updated ship geometry.
+  const width = 50, height = 10, depth = 10;
   const rho0 = 1.225;
   const scaleHeight = 8400;
   const scalingFactor = 0.000000000012;
