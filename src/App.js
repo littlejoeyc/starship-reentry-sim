@@ -5,16 +5,17 @@ import { OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { shaderMaterial } from '@react-three/drei';
 
-// Create a custom shader material using drei's shaderMaterial helper.
-// It accepts uniforms and vertex/fragment shaders.
+// Create a custom shader material for the atmosphere volume.
+// Now it includes decay scales for both horizontal and vertical directions.
 const AtmosphereMaterial = shaderMaterial(
-  // Uniforms:
   {
     effectiveHeat: 0,
     baseTemp: 300,
     plasmaThreshold: 3000,
+    hDecayScale: 3.0, // horizontal decay (in meters)
+    vDecayScale: 5.0, // vertical decay (in meters); bottom is at y = -5
   },
-  // Vertex Shader:
+  // Vertex shader: pass the vertex position to the fragment shader.
   `
     varying vec3 vPosition;
     void main() {
@@ -22,36 +23,42 @@ const AtmosphereMaterial = shaderMaterial(
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }
   `,
-  // Fragment Shader:
+  // Fragment shader: compute the local heat as a product of horizontal and vertical decay factors.
   `
     uniform float effectiveHeat;
     uniform float baseTemp;
     uniform float plasmaThreshold;
+    uniform float hDecayScale;
+    uniform float vDecayScale;
     varying vec3 vPosition;
     void main() {
-      // Compute horizontal distance from the center of the volume (x-z plane).
+      // Compute horizontal distance from the center (x-z plane).
       float d = length(vPosition.xz);
-      // Compute local heat with an exponential decay (the divisor 3.0 controls the decay rate).
-      float localHeat = effectiveHeat * exp(-d / 3.0);
-      // Compute the temperature. The multiplication by 1e6 scales the local heat.
+      // Horizontal decay factor: decreases with distance.
+      float horizontalFactor = exp(-d / hDecayScale);
+      // Vertical decay factor: assume the bottom of the volume is at y = -5.
+      // At the bottom (vPosition.y = -5) the factor is 1, and it decays upward.
+      float verticalFactor = exp(-((vPosition.y + 5.0) / vDecayScale));
+      // Combine the two to get a local heat intensity.
+      float localHeat = effectiveHeat * horizontalFactor * verticalFactor;
+      // Compute a temperature value for visualization.
       float temperature = baseTemp + localHeat * 1e6;
       
       vec3 color;
       if (temperature >= plasmaThreshold) {
-        // If above plasma threshold, use a purple-like color.
+        // Use purple when the temperature exceeds the plasma threshold.
         color = vec3(128.0/255.0, 0.0, 128.0/255.0);
       } else {
-        // Otherwise, interpolate between blue and red.
+        // Otherwise interpolate between blue and red.
         float t = (temperature - baseTemp) / (plasmaThreshold - baseTemp);
         color = vec3(t, 0.0, 1.0 - t);
       }
-      // Set an alpha value so that the volume is slightly transparent.
       gl_FragColor = vec4(color, 0.8);
     }
   `
 );
 
-// Register the material so we can use it as a JSX element.
+// Register the custom material with Three.js.
 extend({ AtmosphereMaterial });
 
 /**
@@ -66,14 +73,13 @@ function CameraFollow({ simulationState }) {
 }
 
 /**
- * AtmosphereVolume renders a 3D box representing a volume of atmosphere.
- * The box has a width and depth of 100 m, and a height (thickness) of 10 m.
- * Its custom shader displays a heat distribution computed from effectiveHeat.
+ * AtmosphereVolume renders a 3D box representing a 100 m × 10 m × 100 m volume of atmosphere.
+ * The custom shader now produces color variations based on both horizontal (x–z)
+ * and vertical (y) positions to better simulate how plasma might form through the layer.
  */
 function AtmosphereVolume({ simulationState, shipBottomY }) {
-  // Create a ref for the mesh to update the shader uniforms.
   const materialRef = useRef();
-  
+
   // Update the shader uniform for effectiveHeat every frame.
   useFrame(() => {
     if (materialRef.current) {
@@ -83,9 +89,7 @@ function AtmosphereVolume({ simulationState, shipBottomY }) {
   
   return (
     <mesh position={[0, shipBottomY, 0]}>
-      {/* The box is 100 m x 10 m x 100 m (width x height x depth).
-          Since BoxGeometry is centered, the box extends 5 m above and below the given position.
-          So by placing it at shipBottomY, its bottom is at shipBottomY - 5 m. */}
+      {/* BoxGeometry: width 100 m, height 10 m, depth 100 m. */}
       <boxGeometry args={[100, 10, 100]} />
       <atmosphereMaterial ref={materialRef} transparent />
     </mesh>
@@ -98,7 +102,7 @@ function AtmosphereVolume({ simulationState, shipBottomY }) {
  */
 function Starship({ magnetPower, simulationState, setSimulationState, isRunning }) {
   const shipRef = useRef();
-  const width = 50, height = 10, depth = 10;
+  const width = 9, height = 50, depth = 9;
   const rho0 = 1.225;
   const scaleHeight = 8400;
   const scalingFactor = 0.000000000012;
@@ -106,7 +110,6 @@ function Starship({ magnetPower, simulationState, setSimulationState, isRunning 
   const terminalVelocity = 200;
   
   useFrame((state, delta) => {
-    // Only update if the simulation is running
     if (!isRunning) return;
     
     let { altitude, speed } = simulationState;
@@ -119,9 +122,8 @@ function Starship({ magnetPower, simulationState, setSimulationState, isRunning 
 
     const g = 9.81;
     const dragDeceleration = density * 0.81 * speed;
-    // Compute the new speed based on gravitational and drag deceleration.
     const computedSpeed = speed - (g + dragDeceleration) * delta;
-    // Ensure speed doesn't drop below terminal velocity while in the air.
+    // Ensure speed doesn't drop below terminal velocity while airborne.
     const newSpeed = altitude > 0 ? Math.max(computedSpeed, terminalVelocity) : 0;
     const newAltitude = Math.max(altitude - newSpeed * delta, 0);
 
@@ -278,10 +280,9 @@ export default function App() {
           setSimulationState={setSimulationState}
           isRunning={isRunning}
         />
-        {/* Place the atmospheric volume below the ship.
-            The ship's bottom (in world space) is at (simulationState.altitude/1000) - 25.
-            We position the volume so that its bottom aligns with the ship's bottom.
-            Since the volume is 10 m tall and centered on its origin, we set its y-position to (shipBottomY + 5). */}
+        {/* Position the atmospheric volume just below the ship.
+            The ship’s bottom is at (simulationState.altitude/1000) - 25.
+            Since the volume is 10 m tall, we place it so that its bottom aligns with the ship bottom. */}
         <AtmosphereVolume
           simulationState={simulationState}
           shipBottomY={(simulationState.altitude / 1000) - 25 + 5}
