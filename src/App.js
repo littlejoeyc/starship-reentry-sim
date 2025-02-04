@@ -41,7 +41,7 @@ function AtmosphereLayer({ simulationState, shipBottomY, resolution = 200 }) {
     const imgData = ctx.createImageData(canvas.width, canvas.height);
     const data = imgData.data;
 
-    const baseTemp = 300;
+    const baseTemp = 0;
     const plasmaThreshold = 3000;
     for (let j = 0; j < canvas.height; j++) {
       for (let i = 0; i < canvas.width; i++) {
@@ -89,7 +89,9 @@ function Starship({ magnetPower, simulationState, setSimulationState, isRunning 
   const width = 50, height = 10, depth = 10;
   const rho0 = 1.225;
   const scaleHeight = 8400;
-  const scalingFactor = 0.0000000000012;
+  const scalingFactor = 0.000000000012;
+  // Define terminal velocity (m/s); starship speed won't drop below this value while airborne.
+  const terminalVelocity = 200;
   
   useFrame((state, delta) => {
     // Only update if the simulation is running
@@ -100,12 +102,15 @@ function Starship({ magnetPower, simulationState, setSimulationState, isRunning 
     
     const density = rho0 * Math.exp(-altitude / scaleHeight);
     const heatFlux = density * Math.pow(speed, 3);
-    const reductionFactor = 1 - magnetPower / 5;
+    const reductionFactor = 1 - magnetPower / 10;
     const effectiveHeat = heatFlux * reductionFactor * scalingFactor;
 
     const g = 9.81;
     const dragDeceleration = density * 0.81 * speed;
-    const newSpeed = Math.max(speed - (g + dragDeceleration) * delta, 0);
+    // Compute the new speed based on gravitational and drag deceleration.
+    const computedSpeed = speed - (g + dragDeceleration) * delta;
+    // Ensure speed doesn't drop below terminal velocity while in the air.
+    const newSpeed = altitude > 0 ? Math.max(computedSpeed, terminalVelocity) : 0;
     const newAltitude = Math.max(altitude - newSpeed * delta, 0);
 
     setSimulationState({
