@@ -6,14 +6,16 @@ import * as THREE from 'three';
 import { shaderMaterial } from '@react-three/drei';
 
 // Create a custom shader material for the atmosphere volume.
-// Now it includes decay scales for both horizontal and vertical directions.
+// This version uses ray marching with a robust ray–box intersection.
 const AtmosphereMaterial = shaderMaterial(
   {
     effectiveHeat: 0,
     baseTemp: 300,
     plasmaThreshold: 3000,
-    hDecayScale: 3.0, // horizontal decay (in meters)
-    vDecayScale: 5.0, // vertical decay (in meters); bottom is at y = -5
+    hDecayScale: 3.0,   // horizontal decay (in meters)
+    vDecayScale: 5.0,   // vertical decay (in meters); bottom is at y = -5
+    rayOrigin: new THREE.Vector3(), // camera position in volume-local space
+    boxHalfSize: new THREE.Vector3(50, 5, 50), // half dimensions of the box volume
   },
   // Vertex shader: pass the vertex position to the fragment shader.
   `
@@ -23,38 +25,64 @@ const AtmosphereMaterial = shaderMaterial(
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }
   `,
-  // Fragment shader: compute the local heat as a product of horizontal and vertical decay factors.
+  // Fragment shader: perform ray marching using a robust ray-box intersection.
   `
     uniform float effectiveHeat;
     uniform float baseTemp;
     uniform float plasmaThreshold;
     uniform float hDecayScale;
     uniform float vDecayScale;
+    uniform vec3 rayOrigin;
+    uniform vec3 boxHalfSize;
     varying vec3 vPosition;
+
+    // Computes ray-box intersection in object space.
     void main() {
-      // Compute horizontal distance from the center (x-z plane).
-      float d = length(vPosition.xz);
-      // Horizontal decay factor: decreases with distance.
-      float horizontalFactor = exp(-d / hDecayScale);
-      // Vertical decay factor: assume the bottom of the volume is at y = -5.
-      // At the bottom (vPosition.y = -5) the factor is 1, and it decays upward.
-      float verticalFactor = exp(-((vPosition.y + 5.0) / vDecayScale));
-      // Combine the two to get a local heat intensity.
-      float localHeat = effectiveHeat * horizontalFactor * verticalFactor;
-      // Compute a temperature value for visualization.
-      float temperature = baseTemp + localHeat * 1e6;
-      
-      vec3 color;
-      if (temperature >= plasmaThreshold) {
-        // Use purple when the temperature exceeds the plasma threshold.
-        color = vec3(128.0/255.0, 0.0, 128.0/255.0);
-      } else {
-        // Otherwise interpolate between blue and red.
-        float t = (temperature - baseTemp) / (plasmaThreshold - baseTemp);
-        color = vec3(t, 0.0, 1.0 - t);
+      // Compute the ray direction (in local/object space) from rayOrigin to current fragment position.
+      vec3 rayDir = normalize(vPosition - rayOrigin);
+
+      // Compute intersection distances along each axis using the slabs method.
+      vec3 invDir = 1.0 / rayDir;
+      vec3 t0s = (-boxHalfSize - rayOrigin) * invDir;
+      vec3 t1s = ( boxHalfSize - rayOrigin) * invDir;
+      vec3 tsmaller = min(t0s, t1s);
+      vec3 tbigger  = max(t0s, t1s);
+      float tmin = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
+      float tmax = min(min(tbigger.x, tbigger.y), tbigger.z);
+
+      // If no intersection, discard fragment.
+      if(tmax < 0.0 || tmin > tmax){
+        discard;
       }
-      // Changed alpha value from 0.8 to 0.4 for greater translucency.
-      gl_FragColor = vec4(color, 0.4);
+      
+      // We'll march from t = tmin to t = tmax.
+      int steps = 200;
+      float dt = (tmax - tmin) / float(steps);
+      
+      vec3 maxColor = vec3(0.0);
+
+      // Ray-march through the volume.
+      for (int i = 0; i < 200; i++) {
+        float t = tmin + dt * float(i);
+        vec3 samplePos = rayOrigin + rayDir * t;
+        // Compute horizontal decay factor based on xz distance.
+        float horizontalFactor = exp(-length(samplePos.xz) / hDecayScale);
+        // Compute vertical decay factor (assume volume bottom at y = -5).
+        float verticalFactor = exp(-((samplePos.y + 5.0) / vDecayScale));
+        float localHeat = effectiveHeat * horizontalFactor * verticalFactor;
+        float temperature = baseTemp + localHeat * 1e6;
+        
+        vec3 sampleColor;
+        if (temperature >= plasmaThreshold) {
+          sampleColor = vec3(128.0/255.0, 0.0, 128.0/255.0);
+        } else {
+          float tVal = (temperature - baseTemp) / (plasmaThreshold - baseTemp);
+          sampleColor = vec3(tVal, 0.0, 1.0 - tVal);
+        }
+        maxColor = max(maxColor, sampleColor);
+      }
+      
+      gl_FragColor = vec4(maxColor, 0.4);
     }
   `
 );
@@ -75,24 +103,30 @@ function CameraFollow({ simulationState }) {
 
 /**
  * AtmosphereVolume renders a 3D box representing a 100 m × 10 m × 100 m volume of atmosphere.
- * The custom shader now produces color variations based on both horizontal (x–z)
- * and vertical (y) positions to better simulate how plasma might form through the layer.
+ * The shader performs robust ray marching so that internal heat variations (plasma) are visible
+ * from any viewing angle.
  */
 function AtmosphereVolume({ simulationState, shipBottomY }) {
   const materialRef = useRef();
+  const { camera } = useThree();
 
-  // Update the shader uniform for effectiveHeat every frame.
+  // Update shader uniforms every frame.
   useFrame(() => {
     if (materialRef.current) {
       materialRef.current.uniforms.effectiveHeat.value = simulationState.effectiveHeat;
+      // Compute the camera position in volume-local space.
+      // The mesh is positioned at [0, shipBottomY, 0] in world space, and the geometry is centered at (0,0,0).
+      const localCamPos = camera.position.clone();
+      localCamPos.y -= shipBottomY; 
+      materialRef.current.uniforms.rayOrigin.value.copy(localCamPos);
     }
   });
   
   return (
     <mesh position={[0, shipBottomY, 0]}>
       {/* BoxGeometry: width 100 m, height 10 m, depth 100 m. */}
-      <boxGeometry args={[100, 10, 100]} />
-      <atmosphereMaterial ref={materialRef} transparent />
+      <boxGeometry args={[100, 100, 100]} />
+      <atmosphereMaterial ref={materialRef} transparent side={THREE.DoubleSide} />
     </mesh>
   );
 }
@@ -144,7 +178,7 @@ function Starship({ magnetPower, simulationState, setSimulationState, isRunning 
     <group ref={shipRef}>
       <mesh>
         <boxGeometry args={[width, height, depth]} />
-        <meshStandardMaterial color="gray" transparent opacity={0.2} />
+        <meshStandardMaterial color="gray" transparent opacity={0.5} />
       </mesh>
     </group>
   );
@@ -287,7 +321,7 @@ export default function App() {
             Since the volume is 10 m tall, we place it so that its bottom aligns with the ship bottom. */}
         <AtmosphereVolume
           simulationState={simulationState}
-          shipBottomY={(simulationState.altitude / 1000) - 25 + 5}
+          shipBottomY={(simulationState.altitude / 1000) - 20 + 5}
         />
         <OrbitControls target={[0, simulationState.altitude / 1000, 0]} />
         <CameraFollow simulationState={simulationState} />
