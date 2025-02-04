@@ -1,8 +1,58 @@
 // src/App.js
 import React, { useState, useRef, useEffect } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls, Text } from '@react-three/drei';
+import { Canvas, useFrame, useThree, extend } from '@react-three/fiber';
+import { OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
+import { shaderMaterial } from '@react-three/drei';
+
+// Create a custom shader material using drei's shaderMaterial helper.
+// It accepts uniforms and vertex/fragment shaders.
+const AtmosphereMaterial = shaderMaterial(
+  // Uniforms:
+  {
+    effectiveHeat: 0,
+    baseTemp: 300,
+    plasmaThreshold: 3000,
+  },
+  // Vertex Shader:
+  `
+    varying vec3 vPosition;
+    void main() {
+      vPosition = position;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  // Fragment Shader:
+  `
+    uniform float effectiveHeat;
+    uniform float baseTemp;
+    uniform float plasmaThreshold;
+    varying vec3 vPosition;
+    void main() {
+      // Compute horizontal distance from the center of the volume (x-z plane).
+      float d = length(vPosition.xz);
+      // Compute local heat with an exponential decay (the divisor 3.0 controls the decay rate).
+      float localHeat = effectiveHeat * exp(-d / 3.0);
+      // Compute the temperature. The multiplication by 1e6 scales the local heat.
+      float temperature = baseTemp + localHeat * 1e6;
+      
+      vec3 color;
+      if (temperature >= plasmaThreshold) {
+        // If above plasma threshold, use a purple-like color.
+        color = vec3(128.0/255.0, 0.0, 128.0/255.0);
+      } else {
+        // Otherwise, interpolate between blue and red.
+        float t = (temperature - baseTemp) / (plasmaThreshold - baseTemp);
+        color = vec3(t, 0.0, 1.0 - t);
+      }
+      // Set an alpha value so that the volume is slightly transparent.
+      gl_FragColor = vec4(color, 0.8);
+    }
+  `
+);
+
+// Register the material so we can use it as a JSX element.
+extend({ AtmosphereMaterial });
 
 /**
  * CameraFollow updates the camera to look at the starship's current center.
@@ -16,68 +66,30 @@ function CameraFollow({ simulationState }) {
 }
 
 /**
- * AtmosphereLayer renders a horizontal slice representing the 10 m of air
- * immediately below the ship. Its texture is updated each frame from an offscreen canvas.
+ * AtmosphereVolume renders a 3D box representing a volume of atmosphere.
+ * The box has a width and depth of 100 m, and a height (thickness) of 10 m.
+ * Its custom shader displays a heat distribution computed from effectiveHeat.
  */
-function AtmosphereLayer({ simulationState, shipBottomY, resolution = 200 }) {
-  const areaSize = 100;
-  const canvasRef = useRef(document.createElement('canvas'));
-  const textureRef = useRef(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    canvas.width = resolution;
-    canvas.height = resolution;
-  }, [resolution]);
-
-  useEffect(() => {
-    textureRef.current = new THREE.CanvasTexture(canvasRef.current);
-    textureRef.current.minFilter = THREE.LinearFilter;
-  }, []);
-
+function AtmosphereVolume({ simulationState, shipBottomY }) {
+  // Create a ref for the mesh to update the shader uniforms.
+  const materialRef = useRef();
+  
+  // Update the shader uniform for effectiveHeat every frame.
   useFrame(() => {
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    const imgData = ctx.createImageData(canvas.width, canvas.height);
-    const data = imgData.data;
-
-    const baseTemp = 0;
-    const plasmaThreshold = 3000;
-    for (let j = 0; j < canvas.height; j++) {
-      for (let i = 0; i < canvas.width; i++) {
-        const x = (i / canvas.width) * areaSize - areaSize / 2;
-        const z = (j / canvas.height) * areaSize - areaSize / 2;
-        const d = Math.sqrt(x * x + z * z);
-        const localHeat = simulationState.effectiveHeat * Math.exp(-d / 3);
-        const temperature = baseTemp + localHeat * 1e6;
-        
-        let r, g, b;
-        if (temperature >= plasmaThreshold) {
-          r = 128; g = 0; b = 128;
-        } else {
-          const t = (temperature - baseTemp) / (plasmaThreshold - baseTemp);
-          r = Math.floor(255 * t);
-          g = 0;
-          b = Math.floor(255 * (1 - t));
-        }
-        
-        const index = (j * canvas.width + i) * 4;
-        data[index] = r;
-        data[index + 1] = g;
-        data[index + 2] = b;
-        data[index + 3] = 255;
-      }
+    if (materialRef.current) {
+      materialRef.current.uniforms.effectiveHeat.value = simulationState.effectiveHeat;
     }
-    ctx.putImageData(imgData, 0, 0);
-    if (textureRef.current) textureRef.current.needsUpdate = true;
   });
-
-  return textureRef.current ? (
-    <mesh position={[0, shipBottomY - areaSize / 2, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-      <planeGeometry args={[areaSize, areaSize]} />
-      <meshBasicMaterial map={textureRef.current} side={THREE.DoubleSide} />
+  
+  return (
+    <mesh position={[0, shipBottomY, 0]}>
+      {/* The box is 100 m x 10 m x 100 m (width x height x depth).
+          Since BoxGeometry is centered, the box extends 5 m above and below the given position.
+          So by placing it at shipBottomY, its bottom is at shipBottomY - 5 m. */}
+      <boxGeometry args={[100, 10, 100]} />
+      <atmosphereMaterial ref={materialRef} transparent />
     </mesh>
-  ) : null;
+  );
 }
 
 /**
@@ -102,7 +114,7 @@ function Starship({ magnetPower, simulationState, setSimulationState, isRunning 
     
     const density = rho0 * Math.exp(-altitude / scaleHeight);
     const heatFlux = density * Math.pow(speed, 3);
-    const reductionFactor = 1 - magnetPower / 10;
+    const reductionFactor = 1 - magnetPower / 5;
     const effectiveHeat = heatFlux * reductionFactor * scalingFactor;
 
     const g = 9.81;
@@ -266,11 +278,13 @@ export default function App() {
           setSimulationState={setSimulationState}
           isRunning={isRunning}
         />
-        {/* The bottom of the ship is at (simulationState.altitude/1000) - 25 */}
-        <AtmosphereLayer
+        {/* Place the atmospheric volume below the ship.
+            The ship's bottom (in world space) is at (simulationState.altitude/1000) - 25.
+            We position the volume so that its bottom aligns with the ship's bottom.
+            Since the volume is 10 m tall and centered on its origin, we set its y-position to (shipBottomY + 5). */}
+        <AtmosphereVolume
           simulationState={simulationState}
-          shipBottomY={(simulationState.altitude / 1000) - 25}
-          resolution={200}
+          shipBottomY={(simulationState.altitude / 1000) - 25 + 5}
         />
         <OrbitControls target={[0, simulationState.altitude / 1000, 0]} />
         <CameraFollow simulationState={simulationState} />
